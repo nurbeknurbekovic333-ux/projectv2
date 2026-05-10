@@ -51,6 +51,11 @@ class Config:
     # Retry / resilience knobs for LLMClient.
     max_retries: int = 5
     retry_backoff_max: float = 30.0
+    # Per-call response cap (in tokens). We pass this as ``max_tokens`` to
+    # every chat.completions.create call so the server doesn't fall back
+    # to a tiny default that truncates large implementer outputs
+    # mid-string. Kimi K2.6 supports up to ~8k completion tokens.
+    max_response_tokens: int = 8192
 
     @property
     def api_key(self) -> str:
@@ -116,6 +121,9 @@ class Config:
         retry_backoff_max = max(
             1.0, float(os.environ.get("ORGOS_RETRY_BACKOFF_MAX", "30.0"))
         )
+        max_response_tokens = max(
+            512, int(os.environ.get("ORGOS_MAX_RESPONSE_TOKENS", "8192"))
+        )
 
         output_dir = Path(os.environ.get("ORGOS_OUTPUT_DIR", "output")).expanduser()
 
@@ -138,6 +146,7 @@ class Config:
             prompts_dir=prompts_dir,
             max_retries=max_retries,
             retry_backoff_max=retry_backoff_max,
+            max_response_tokens=max_response_tokens,
         )
 
     def model_for(self, role: str) -> str:
