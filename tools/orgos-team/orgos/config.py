@@ -48,6 +48,9 @@ class Config:
     github_token: str | None
     github_owner: str | None
     prompts_dir: Path
+    # Retry / resilience knobs for LLMClient.
+    max_retries: int = 5
+    retry_backoff_max: float = 30.0
 
     @property
     def api_key(self) -> str:
@@ -109,6 +112,11 @@ class Config:
         max_concurrency = int(os.environ.get("ORGOS_MAX_CONCURRENCY", "4"))
         temperature = float(os.environ.get("ORGOS_TEMPERATURE", "0.2"))
 
+        max_retries = max(1, int(os.environ.get("ORGOS_MAX_RETRIES", "5")))
+        retry_backoff_max = max(
+            1.0, float(os.environ.get("ORGOS_RETRY_BACKOFF_MAX", "30.0"))
+        )
+
         output_dir = Path(os.environ.get("ORGOS_OUTPUT_DIR", "output")).expanduser()
 
         github_token = os.environ.get("GITHUB_TOKEN", "").strip() or None
@@ -128,6 +136,8 @@ class Config:
             github_token=github_token,
             github_owner=github_owner,
             prompts_dir=prompts_dir,
+            max_retries=max_retries,
+            retry_backoff_max=retry_backoff_max,
         )
 
     def model_for(self, role: str) -> str:

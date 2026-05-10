@@ -3,7 +3,8 @@
 Agents always request structured JSON output. The wrapper:
   * loads the prompt template for a role from prompts/<role>.md
   * calls the LLM with JSON response_format
-  * retries on transient errors with exponential backoff
+  * retries on transient errors with exponential backoff (configurable
+    via ``ORGOS_MAX_RETRIES`` and ``ORGOS_RETRY_BACKOFF_MAX``)
   * validates the JSON against the requested Pydantic schema
 """
 
@@ -41,6 +42,10 @@ class LLMClient:
     ``CANOPYWAVE_API_KEY`` / ``CANOPYWAVE_BASE_URL`` as fallback). All
     calls share a single semaphore so the global concurrency cap
     (``ORGOS_MAX_CONCURRENCY``) still applies across roles.
+
+    Retry behaviour is driven by ``Config.max_retries`` (default 5) and
+    ``Config.retry_backoff_max`` (default 30s) — set via the
+    ``ORGOS_MAX_RETRIES`` and ``ORGOS_RETRY_BACKOFF_MAX`` env vars.
     """
 
     def __init__(self, config: Config) -> None:
@@ -93,10 +98,22 @@ class LLMClient:
         role: str,
         user_message: str,
         schema: type[T],
-        max_retries: int = 3,
+        max_retries: int | None = None,
         max_tokens: int | None = None,
     ) -> T:
-        """Call the model, parse JSON, validate against `schema`, return instance."""
+        """Call the model, parse JSON, validate against `schema`, return instance.
+
+        Retries up to ``max_retries`` (default: ``config.max_retries``) on:
+          * transient transport / API errors (rate-limit, connection, 5xx)
+            — with exponential backoff + jitter, capped at
+            ``config.retry_backoff_max`` seconds;
+          * malformed JSON in the response body (no sleep);
+          * JSON that doesn't validate against ``schema`` (no sleep).
+        """
+
+        if max_retries is None:
+            max_retries = self.config.max_retries
+        max_retries = max(1, max_retries)
 
         system_prompt = self.load_prompt(role)
         model = self.config.model_for(role)
@@ -114,6 +131,7 @@ class LLMClient:
 
         last_err: Exception | None = None
         for attempt in range(1, max_retries + 1):
+            response = None
             async with self._semaphore:
                 try:
                     response = await client.chat.completions.create(
@@ -128,6 +146,8 @@ class LLMClient:
                     )
                 except (RateLimitError, APIConnectionError, APIError) as e:
                     last_err = e
+                    if attempt == max_retries:
+                        break
                     delay = self._backoff(attempt)
                     logger.warning(
                         "LLM call %s failed (%s). Attempt %d/%d. Retrying in %.1fs",
@@ -171,11 +191,10 @@ class LLMClient:
             f"Role '{role}' exhausted retries (last error: {last_err})"
         )
 
-    @staticmethod
-    def _backoff(attempt: int) -> float:
+    def _backoff(self, attempt: int) -> float:
         base = 2.0 ** (attempt - 1)
         jitter = random.uniform(0, 0.5)
-        return min(base + jitter, 30.0)
+        return min(base + jitter, self.config.retry_backoff_max)
 
     async def close(self) -> None:
         # _client_by_endpoint holds the unique underlying clients; closing
