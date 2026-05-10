@@ -239,6 +239,18 @@ def _language_for(path: str) -> str:
     }.get(suffix, "")
 
 
+ROLES_FOR_UI = (
+    "product",
+    "architect",
+    "backend",
+    "frontend",
+    "devops",
+    "qa",
+    "reviewer",
+    "security",
+)
+
+
 def _build_config_from_sidebar() -> Config | None:
     """Build a Config from sidebar overrides, falling back to .env."""
     api_key = st.session_state.get("api_key", "").strip()
@@ -255,35 +267,46 @@ def _build_config_from_sidebar() -> Config | None:
                 env_key = ""
         api_key = env_key
 
-    if not api_key:
+    # Per-role API key overrides from sidebar
+    sidebar_role_keys: dict[str, str] = {}
+    for role in ROLES_FOR_UI:
+        val = st.session_state.get(f"role_key_{role}", "").strip()
+        if val:
+            sidebar_role_keys[role] = val
+
+    if not api_key and not sidebar_role_keys:
         # In demo mode we don't need a real key, but Config.load() still
         # demands SOMETHING in the env. Use a placeholder.
         if st.session_state.get("demo_mode", False):
             api_key = "demo-mode-no-network-calls"
         else:
             st.error(
-                "No CANOPYWAVE_API_KEY provided. "
-                "Either paste it in the sidebar or put it in `.env` next to this app, "
-                "or enable 🎭 Demo mode in the sidebar."
+                "No CANOPYWAVE_API_KEY provided. Either paste a shared key in "
+                "the sidebar, set per-role keys in 'Per-role API keys', or "
+                "enable 🎭 Demo mode."
             )
             return None
 
-    os.environ["CANOPYWAVE_API_KEY"] = api_key
+    if api_key:
+        os.environ["CANOPYWAVE_API_KEY"] = api_key
+    else:
+        # No shared key, only per-role keys -> clear the shared one so
+        # Config.load() validates each role against its own override.
+        os.environ.pop("CANOPYWAVE_API_KEY", None)
 
-    # apply per-role overrides into env so Config.load picks them up
+    for role in ROLES_FOR_UI:
+        env_var = f"CANOPYWAVE_API_KEY_{role.upper()}"
+        val = sidebar_role_keys.get(role)
+        if val:
+            os.environ[env_var] = val
+        else:
+            os.environ.pop(env_var, None)
+
+    # apply per-role MODEL overrides into env so Config.load picks them up
     default_model = st.session_state.get("default_model", "moonshotai/kimi-k2.6").strip()
     os.environ["ORGOS_DEFAULT_MODEL"] = default_model
 
-    for role in (
-        "product",
-        "architect",
-        "backend",
-        "frontend",
-        "devops",
-        "qa",
-        "reviewer",
-        "security",
-    ):
+    for role in ROLES_FOR_UI:
         key = f"role_{role}"
         val = st.session_state.get(key, "").strip()
         env_key = f"ORGOS_MODEL_{role.upper()}"
@@ -327,12 +350,31 @@ def _render_sidebar() -> None:
 
         st.markdown("### 🔑 API")
         st.text_input(
-            "CANOPYWAVE_API_KEY",
+            "CANOPYWAVE_API_KEY (shared fallback)",
             type="password",
-            placeholder="Leave empty to use .env",
+            placeholder="Leave empty to use .env or per-role keys",
             key="api_key",
             disabled=st.session_state.get("demo_mode", False),
+            help=(
+                "Shared key used by any role that doesn't have its own "
+                "per-role key set below. Leave empty if every role has its "
+                "own key."
+            ),
         )
+        with st.expander("Per-role API keys", expanded=False):
+            st.caption(
+                "Each sub-agent can use its own Canopy Wave key. Leave a "
+                "field empty to fall back to the shared key above."
+            )
+            for role in ROLES_FOR_UI:
+                st.text_input(
+                    f"{role}",
+                    type="password",
+                    value=st.session_state.get(f"role_key_{role}", ""),
+                    key=f"role_key_{role}",
+                    placeholder="(use shared)",
+                    disabled=st.session_state.get("demo_mode", False),
+                )
 
         st.markdown("### 🧠 Models")
         st.text_input(
@@ -341,16 +383,7 @@ def _render_sidebar() -> None:
             key="default_model",
         )
         with st.expander("Per-role overrides", expanded=False):
-            for role in (
-                "product",
-                "architect",
-                "backend",
-                "frontend",
-                "devops",
-                "qa",
-                "reviewer",
-                "security",
-            ):
+            for role in ROLES_FOR_UI:
                 st.text_input(
                     f"{role}",
                     value=st.session_state.get(f"role_{role}", ""),
