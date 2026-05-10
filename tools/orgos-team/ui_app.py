@@ -31,6 +31,7 @@ import streamlit as st
 
 from orgos.config import Config
 from orgos.demo_client import DemoLLMClient, DemoTestRunner
+from orgos.github_publish import GitHubPublishError, PublishResult, publish_to_github
 from orgos.llm import LLMClient, LLMError
 from orgos.output import git_init_and_commit, write_project
 from orgos.schemas import Finding, GeneratedFile, Plan, Spec, TestRunResult
@@ -75,12 +76,22 @@ _init_state()
 # ─── workers ──────────────────────────────────────────────────────────────
 
 
+@dataclasses.dataclass(frozen=True)
+class _PublishConfig:
+    enabled: bool
+    token: str
+    owner: str
+    repo_name_override: str
+    private: bool
+
+
 def _worker_target(
     config: Config,
     idea: str,
     do_git_init: bool,
     demo_mode: bool,
     auto_execute_tests: bool,
+    publish: _PublishConfig,
     event_q: "queue.Queue[tuple[str, Any]]",
 ) -> None:
     """Run the async workflow in a background thread.
@@ -137,8 +148,50 @@ def _worker_target(
             findings=findings,
             notes=notes,
         )
-        if do_git_init:
+        if do_git_init or publish.enabled:
             git_init_and_commit(project_root)
+
+        publish_result: PublishResult | None = None
+        publish_error: str | None = None
+        publish_skipped_reason: str | None = None
+        if publish.enabled:
+            if demo_mode:
+                publish_skipped_reason = (
+                    "Demo mode is on — not pushing to GitHub."
+                )
+            elif (
+                test_run is not None
+                and test_run.ran
+                and not test_run.passed
+            ):
+                publish_skipped_reason = (
+                    "Generated tests failed — not pushing to GitHub."
+                )
+            else:
+                repo_name = (
+                    publish.repo_name_override.strip()
+                    or plan.project_name
+                )
+                progress(
+                    "gh.publish.start",
+                    f"Pushing to GitHub: {publish.owner}/{repo_name}",
+                )
+                try:
+                    publish_result = publish_to_github(
+                        project_root=project_root,
+                        token=publish.token,
+                        owner=publish.owner,
+                        repo_name=repo_name,
+                        description=spec.one_liner,
+                        private=publish.private,
+                    )
+                    progress(
+                        "gh.publish.done",
+                        f"Pushed to {publish_result.html_url}",
+                    )
+                except GitHubPublishError as e:
+                    publish_error = str(e)
+                    progress("gh.publish.error", publish_error)
 
         event_q.put(
             (
@@ -152,6 +205,9 @@ def _worker_target(
                     "project_root": str(project_root),
                     "test_run": test_run,
                     "test_findings": test_findings,
+                    "publish_result": publish_result,
+                    "publish_error": publish_error,
+                    "publish_skipped_reason": publish_skipped_reason,
                 },
             )
         )
@@ -427,6 +483,50 @@ def _render_sidebar() -> None:
                 "dirs with 90s timeouts."
             )
 
+        st.markdown("### 📤 GitHub auto-publish")
+        st.checkbox(
+            "Push to GitHub after tests pass",
+            value=st.session_state.get("gh_publish", False),
+            key="gh_publish",
+            help=(
+                "After the fix pass, run pytest, and only if tests pass, "
+                "create a private repo on GitHub under GITHUB_OWNER and push "
+                "the project there using GITHUB_TOKEN. Implies the "
+                "'Run pytest after generation' checkbox above. Skipped in "
+                "Demo mode."
+            ),
+            disabled=st.session_state.get("demo_mode", False),
+        )
+        if st.session_state.get("gh_publish", False):
+            st.text_input(
+                "GITHUB_TOKEN",
+                type="password",
+                placeholder="Leave empty to use .env",
+                key="gh_token",
+                help=(
+                    "Personal-access token (classic, `repo` scope) or "
+                    "fine-grained token with Contents+Administration write "
+                    "on the target repos."
+                ),
+            )
+            st.text_input(
+                "GITHUB_OWNER",
+                value=st.session_state.get("gh_owner", ""),
+                placeholder="user or org name (e.g. nurbeknurbekovic333-ux)",
+                key="gh_owner",
+            )
+            st.text_input(
+                "Repo name override (optional)",
+                value=st.session_state.get("gh_repo_name", ""),
+                placeholder="(uses architect's project name by default)",
+                key="gh_repo_name",
+            )
+            st.checkbox(
+                "Create as public repo",
+                value=st.session_state.get("gh_public", False),
+                key="gh_public",
+            )
+
         st.markdown("---")
         st.caption(
             "Canopy Wave: [docs](https://canopywave.com/docs/get-started/quick-start) · "
@@ -547,6 +647,21 @@ def _render_results() -> None:
     project_root = result["project_root"]
 
     st.success(f"Generated: `{project_root}`")
+
+    publish_result: PublishResult | None = result.get("publish_result")
+    publish_error: str | None = result.get("publish_error")
+    publish_skipped_reason: str | None = result.get("publish_skipped_reason")
+    if publish_result is not None:
+        verb = "Created" if publish_result.created else "Pushed to existing"
+        st.success(
+            f"📤 {verb} repo: [{publish_result.owner}/{publish_result.repo}]"
+            f"({publish_result.html_url})"
+        )
+    elif publish_error:
+        st.error(f"GitHub publish failed: {publish_error}")
+    elif publish_skipped_reason:
+        st.warning(f"GitHub publish skipped: {publish_skipped_reason}")
+
     elapsed = None
     if st.session_state.started_at and st.session_state.finished_at:
         elapsed = (st.session_state.finished_at - st.session_state.started_at).total_seconds()
@@ -709,9 +824,41 @@ def main() -> None:
         do_git = bool(st.session_state.get("git_init", True))
         demo_mode = bool(st.session_state.get("demo_mode", False))
         auto_tests = bool(st.session_state.get("auto_execute_tests", False))
+        gh_publish_on = (
+            bool(st.session_state.get("gh_publish", False))
+            and not demo_mode
+        )
+        if gh_publish_on:
+            # gh-publish implies auto-execute-tests so we never push a
+            # failing project.
+            auto_tests = True
+        gh_token = (
+            st.session_state.get("gh_token", "").strip()
+            or os.environ.get("GITHUB_TOKEN", "").strip()
+            or (config.github_token or "")
+        )
+        gh_owner = (
+            st.session_state.get("gh_owner", "").strip()
+            or os.environ.get("GITHUB_OWNER", "").strip()
+            or (config.github_owner or "")
+        )
+        if gh_publish_on and (not gh_token or not gh_owner):
+            st.error(
+                "GitHub publish needs both GITHUB_TOKEN and GITHUB_OWNER. "
+                "Fill them in the sidebar or `.env`."
+            )
+            st.session_state.status = "idle"
+            return
+        publish = _PublishConfig(
+            enabled=gh_publish_on,
+            token=gh_token,
+            owner=gh_owner,
+            repo_name_override=st.session_state.get("gh_repo_name", "").strip(),
+            private=not bool(st.session_state.get("gh_public", False)),
+        )
         t = threading.Thread(
             target=_worker_target,
-            args=(config, idea, do_git, demo_mode, auto_tests, q),
+            args=(config, idea, do_git, demo_mode, auto_tests, publish, q),
             daemon=True,
         )
         t.start()

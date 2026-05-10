@@ -155,8 +155,47 @@ python -m orgos --help
   --output-dir      переопределить ORGOS_OUTPUT_DIR
   --git-init/--no-git-init   делать ли git init (по умолчанию yes)
   --auto-execute-tests/--no-auto-execute-tests   запустить pytest после генерации (по умолчанию no)
+  --gh-publish/--no-gh-publish    после прохода тестов залить проект в private-репо на GitHub
+  --gh-repo-name TEXT             имя репо (по умолчанию = project_name из плана)
+  --gh-public / --gh-private      создать публичный или приватный репо (по умолчанию private)
   --verbose, -v     debug-логи
 ```
+
+### Авто-публикация на GitHub
+
+Команда:
+
+```bash
+python -m orgos "FastAPI URL shortener" --gh-publish
+```
+
+`--gh-publish` неявно включает `--auto-execute-tests`, чтобы случайно не запушить
+сгенерированный код, который сам же не проходит свои собственные тесты:
+
+1. orgos прогоняет полный pipeline + fix-loop + (опционально extra fix-pass от failed tests);
+2. если итоговый `TestRunResult.passed = False` — пуш **пропускается**, выход с кодом 3;
+3. иначе orgos создаёт **private** репозиторий (или reuses существующий) под
+   `GITHUB_OWNER` через REST API и пушит проект, авторизуясь через
+   `https://x-access-token:<GITHUB_TOKEN>@github.com/...` — никаких ssh-ключей.
+4. После успешного push токен убирается из `git remote get-url origin`, чтобы
+   не оставаться в `.git/config` на диске.
+
+В `.env`:
+
+```
+GITHUB_TOKEN=ghp_xxx_or_github_pat_xxx
+GITHUB_OWNER=your-user-or-org
+```
+
+Минимальные права токена:
+- классический PAT — scope `repo`;
+- fine-grained PAT — Contents: read & write, плюс Administration: read & write,
+  если orgos должен **создавать** репозитории (а не использовать уже существующие).
+
+В Web UI то же самое — раздел **«📤 GitHub auto-publish»** в sidebar:
+чекбокс «Push to GitHub after tests pass», поля GITHUB_TOKEN / GITHUB_OWNER /
+имя репо / private-vs-public. Demo mode игнорирует публикацию (нет смысла
+коммитить демо-`hello`).
 
 ### Makefile-шорткаты
 
