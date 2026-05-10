@@ -89,7 +89,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Откройте .env и впишите ваш CANOPYWAVE_API_KEY
+# Откройте .env и впишите ваш CANOPYWAVE_API_KEY (общий fallback) —
+# или сразу `CANOPYWAVE_API_KEY_<ROLE>` для каждого из 8 sub-агентов.
+# См. раздел «Конфигурация» ниже.
 ```
 
 ---
@@ -174,13 +176,48 @@ make clean     # удалить .venv, кеши
 
 | Переменная | Назначение |
 |---|---|
-| `CANOPYWAVE_API_KEY` | **Обязательно.** Ключ от Canopy Wave. |
-| `CANOPYWAVE_BASE_URL` | По умолчанию `https://inference.canopywave.io/v1`. |
+| `CANOPYWAVE_API_KEY` | Общий ключ от Canopy Wave. Используется как **fallback** для любой роли, у которой не задан собственный `CANOPYWAVE_API_KEY_<ROLE>`. Можно оставить пустым, если у каждой роли свой ключ. |
+| `CANOPYWAVE_API_KEY_<ROLE>` | Свой ключ на конкретного sub-агента (PRODUCT, ARCHITECT, BACKEND, FRONTEND, DEVOPS, QA, REVIEWER, SECURITY). Переопределяет `CANOPYWAVE_API_KEY` только для этой роли. |
+| `CANOPYWAVE_BASE_URL` | Общий base URL. По умолчанию `https://inference.canopywave.io/v1`. |
+| `CANOPYWAVE_BASE_URL_<ROLE>` | Свой base URL на роль (например один агент на Canopy Wave, другой на self-hosted vLLM). Пусто → используется общий. |
 | `ORGOS_DEFAULT_MODEL` | Модель для всех агентов. По умолчанию `moonshotai/kimi-k2.6`. |
-| `ORGOS_MODEL_<ROLE>` | Переопределение модели на конкретную роль (PRODUCT, ARCHITECT, BACKEND, FRONTEND, DEVOPS, QA, REVIEWER, SECURITY). |
+| `ORGOS_MODEL_<ROLE>` | Переопределение модели на конкретную роль. |
 | `ORGOS_MAX_CONCURRENCY` | Сколько LLM-вызовов параллельно (по умолчанию 4). |
 | `ORGOS_TEMPERATURE` | Temperature для LLM (по умолчанию 0.2). |
 | `ORGOS_OUTPUT_DIR` | Куда писать сгенерированные проекты (по умолчанию `output`). |
+
+> Хотя бы один ключ должен быть задан для каждой роли — либо собственный
+> `CANOPYWAVE_API_KEY_<ROLE>`, либо общий `CANOPYWAVE_API_KEY` как fallback.
+> Иначе `Config.load()` отказывается стартовать и явно говорит каким именно
+> ролям не хватает ключа.
+
+### Свой API-ключ на каждого sub-агента
+
+Пример: 8 разных аккаунтов Canopy Wave, чтобы изолировать стоимость / blast-radius по ролям:
+
+```
+# общий ключ можно оставить пустым
+CANOPYWAVE_API_KEY=
+
+CANOPYWAVE_API_KEY_PRODUCT=cw_pk_prod_…
+CANOPYWAVE_API_KEY_ARCHITECT=cw_pk_arch_…
+CANOPYWAVE_API_KEY_BACKEND=cw_pk_be_…
+CANOPYWAVE_API_KEY_FRONTEND=cw_pk_fe_…
+CANOPYWAVE_API_KEY_DEVOPS=cw_pk_ops_…
+CANOPYWAVE_API_KEY_QA=cw_pk_qa_…
+CANOPYWAVE_API_KEY_REVIEWER=cw_pk_rev_…
+CANOPYWAVE_API_KEY_SECURITY=cw_pk_sec_…
+```
+
+Или гибридно: общий ключ для большинства ролей + отдельный только для security/reviewer:
+
+```
+CANOPYWAVE_API_KEY=cw_pk_shared_…
+CANOPYWAVE_API_KEY_REVIEWER=cw_pk_rev_only_…
+CANOPYWAVE_API_KEY_SECURITY=cw_pk_sec_only_…
+```
+
+В Web UI (Streamlit) то же самое — в sidebar разворачивается панель **«Per-role API keys»**, где для каждой роли отдельное password-поле.
 
 ### Разные модели для разных ролей
 

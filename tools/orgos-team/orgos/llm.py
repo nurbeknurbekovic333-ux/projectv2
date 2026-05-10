@@ -31,13 +31,51 @@ class LLMError(RuntimeError):
 
 
 class LLMClient:
-    """One client per OrgOS run. Internally serializes via a semaphore."""
+    """One client per OrgOS run.
+
+    Holds **one underlying AsyncOpenAI client per role** so that each
+    sub-agent (product, architect, backend, frontend, devops, qa, reviewer,
+    security) talks to Canopy Wave under its own API key / base URL — as
+    configured via ``CANOPYWAVE_API_KEY_<ROLE>`` and
+    ``CANOPYWAVE_BASE_URL_<ROLE>`` (with the shared
+    ``CANOPYWAVE_API_KEY`` / ``CANOPYWAVE_BASE_URL`` as fallback). All
+    calls share a single semaphore so the global concurrency cap
+    (``ORGOS_MAX_CONCURRENCY``) still applies across roles.
+    """
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
         self._prompt_cache: dict[str, str] = {}
+        self._clients: dict[str, AsyncOpenAI] = {}
+        self._client_by_endpoint: dict[tuple[str, str], AsyncOpenAI] = {}
+
+    def _client_for(self, role: str) -> AsyncOpenAI:
+        cached = self._clients.get(role)
+        if cached is not None:
+            return cached
+        api_key = self.config.api_key_for(role)
+        base_url = self.config.base_url_for(role)
+        # Reuse one underlying httpx client across roles that share the same
+        # (key, base_url) pair so we don't open redundant connection pools
+        # when the user keeps the shared CANOPYWAVE_API_KEY.
+        endpoint = (api_key, base_url)
+        existing = self._client_by_endpoint.get(endpoint)
+        if existing is None:
+            existing = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self._client_by_endpoint[endpoint] = existing
+        self._clients[role] = existing
+        return existing
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Back-compat: returns the underlying client for an arbitrary role.
+
+        Prefer :meth:`_client_for` (or just call ``call_structured``) so the
+        correct per-role key/base URL is used.
+        """
+        any_role = next(iter(self.config.role_api_keys))
+        return self._client_for(any_role)
 
     def load_prompt(self, role: str) -> str:
         if role in self._prompt_cache:
@@ -72,11 +110,13 @@ class LLMClient:
         )
         full_system = system_prompt + json_hint
 
+        client = self._client_for(role)
+
         last_err: Exception | None = None
         for attempt in range(1, max_retries + 1):
             async with self._semaphore:
                 try:
-                    response = await self.client.chat.completions.create(
+                    response = await client.chat.completions.create(
                         model=model,
                         messages=[
                             {"role": "system", "content": full_system},
@@ -138,7 +178,12 @@ class LLMClient:
         return min(base + jitter, 30.0)
 
     async def close(self) -> None:
-        await self.client.close()
+        # _client_by_endpoint holds the unique underlying clients; closing
+        # via _clients would close the same client multiple times.
+        for c in self._client_by_endpoint.values():
+            await c.close()
+        self._clients.clear()
+        self._client_by_endpoint.clear()
 
 
 def _strip_fences(text: str) -> str:
