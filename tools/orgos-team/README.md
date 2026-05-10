@@ -223,6 +223,8 @@ make clean     # удалить .venv, кеши
 | `ORGOS_MODEL_<ROLE>` | Переопределение модели на конкретную роль. |
 | `ORGOS_MAX_CONCURRENCY` | Сколько LLM-вызовов параллельно (по умолчанию 4). |
 | `ORGOS_TEMPERATURE` | Temperature для LLM (по умолчанию 0.2). |
+| `ORGOS_MAX_RETRIES` | Сколько раз повторить один LLM-вызов при transient ошибке (429, connection drop, 5xx, невалидный JSON). По умолчанию 5. |
+| `ORGOS_RETRY_BACKOFF_MAX` | Верхний кап (секунды) экспоненциального backoff между retry. По умолчанию 30.0. |
 | `ORGOS_OUTPUT_DIR` | Куда писать сгенерированные проекты (по умолчанию `output`). |
 
 > Хотя бы один ключ должен быть задан для каждой роли — либо собственный
@@ -460,8 +462,8 @@ tools/orgos-team/
 
 ## Где оно может сломаться (известные ограничения)
 
-- **Rate limits Canopy Wave.** Если уперётесь — снизьте `ORGOS_MAX_CONCURRENCY` до 2 или 1. Retry с экспоненциальным backoff уже встроен в `llm.py`.
-- **JSON-парсинг.** Иногда модель возвращает JSON в markdown-fences. `llm.py` снимает их защитно. Если не помогло — увеличится `max_retries`.
+- **Rate limits Canopy Wave.** Если уперётесь — снизьте `ORGOS_MAX_CONCURRENCY` до 2 или 1. Retry с экспоненциальным backoff уже встроен в `llm.py` (по умолчанию 5 попыток с capped jitter ≤ 30s; настраивается через `ORGOS_MAX_RETRIES` / `ORGOS_RETRY_BACKOFF_MAX`).
+- **JSON-парсинг.** Иногда модель возвращает JSON в markdown-fences. `llm.py` снимает их защитно. Если не помогло — поднимите `ORGOS_MAX_RETRIES`.
 - **Большие файлы.** Если имплементер пытается сгенерировать файл > ~16k токенов, ответ обрежется. Архитектор должен дробить — см. промт `architect.md`.
 - **Кросс-файловые баги.** Reviewer находит часть, но не все. Generated-проект всё равно стоит прогнать через `python -m py_compile` / `tsc --noEmit` и тесты вручную.
 - **`output/` в `.gitignore`.** Сгенерированные проекты не коммитятся в этот репо. Это намеренно: храните их отдельно.
