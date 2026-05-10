@@ -225,6 +225,7 @@ make clean     # удалить .venv, кеши
 | `ORGOS_TEMPERATURE` | Temperature для LLM (по умолчанию 0.2). |
 | `ORGOS_MAX_RETRIES` | Сколько раз повторить один LLM-вызов при transient ошибке (429, connection drop, 5xx, невалидный JSON). По умолчанию 5. |
 | `ORGOS_RETRY_BACKOFF_MAX` | Верхний кап (секунды) экспоненциального backoff между retry. По умолчанию 30.0. |
+| `ORGOS_MAX_RESPONSE_TOKENS` | `max_tokens` на каждый запрос к модели. Без этого Canopy Wave обрезает большие ответы имплементера на середине строки (`Unterminated string`). По умолчанию 8192. |
 | `ORGOS_OUTPUT_DIR` | Куда писать сгенерированные проекты (по умолчанию `output`). |
 
 > Хотя бы один ключ должен быть задан для каждой роли — либо собственный
@@ -464,6 +465,7 @@ tools/orgos-team/
 
 - **Rate limits Canopy Wave.** Если уперётесь — снизьте `ORGOS_MAX_CONCURRENCY` до 2 или 1. Retry с экспоненциальным backoff уже встроен в `llm.py` (по умолчанию 5 попыток с capped jitter ≤ 30s; настраивается через `ORGOS_MAX_RETRIES` / `ORGOS_RETRY_BACKOFF_MAX`).
 - **JSON-парсинг.** Иногда модель возвращает JSON в markdown-fences. `llm.py` снимает их защитно. Если не помогло — поднимите `ORGOS_MAX_RETRIES`.
+- **Truncation на больших проектах.** Если в логах видишь warning `LLM call <role> was TRUNCATED` или ошибку `Unterminated string starting at: line 1 column N` — модель уперлась в `max_tokens` посреди ответа. Подними `ORGOS_MAX_RESPONSE_TOKENS` (по умолчанию 8192) до 16384 или упрости идею проекта так, чтобы архитектор планировал меньше файлов на домен. Чаще всего это случается на frontend-имплементере при 6+ файлах.
 - **Большие файлы.** Если имплементер пытается сгенерировать файл > ~16k токенов, ответ обрежется. Архитектор должен дробить — см. промт `architect.md`.
 - **Кросс-файловые баги.** Reviewer находит часть, но не все. Generated-проект всё равно стоит прогнать через `python -m py_compile` / `tsc --noEmit` и тесты вручную.
 - **`output/` в `.gitignore`.** Сгенерированные проекты не коммитятся в этот репо. Это намеренно: храните их отдельно.

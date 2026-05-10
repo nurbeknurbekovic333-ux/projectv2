@@ -30,7 +30,11 @@ from orgos.llm import LLMClient, LLMError
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _make_config(*, max_retries: int = 5) -> Config:
+def _make_config(
+    *,
+    max_retries: int = 5,
+    max_response_tokens: int = 8192,
+) -> Config:
     """Construct a minimal real Config without touching env vars."""
     role_api_keys = {role: "fake-key" for role in ROLES}
     role_models = {role: "fake-model" for role in ROLES}
@@ -49,6 +53,7 @@ def _make_config(*, max_retries: int = 5) -> Config:
         prompts_dir=REPO_ROOT / "prompts",
         max_retries=max_retries,
         retry_backoff_max=0.05,  # tiny so retry tests don't actually wait
+        max_response_tokens=max_response_tokens,
     )
 
 
@@ -68,6 +73,7 @@ class _FakeMessage:
 @dataclasses.dataclass
 class _FakeChoice:
     message: _FakeMessage
+    finish_reason: str = "stop"
 
 
 @dataclasses.dataclass
@@ -75,8 +81,10 @@ class _FakeCompletion:
     choices: list[_FakeChoice]
 
 
-def _completion(content: str) -> _FakeCompletion:
-    return _FakeCompletion(choices=[_FakeChoice(message=_FakeMessage(content=content))])
+def _completion(content: str, *, finish_reason: str = "stop") -> _FakeCompletion:
+    return _FakeCompletion(
+        choices=[_FakeChoice(message=_FakeMessage(content=content), finish_reason=finish_reason)]
+    )
 
 
 def _rate_limit_error() -> RateLimitError:
@@ -302,3 +310,102 @@ def test_explicit_max_retries_overrides_config() -> None:
         await client.close()
 
     asyncio.run(run())
+
+
+# ---------- max_tokens / truncation tests ----------
+
+
+def test_max_tokens_defaults_to_config_value() -> None:
+    """Without an explicit max_tokens, we send config.max_response_tokens."""
+    async def run() -> None:
+        cfg = _make_config(max_response_tokens=4321)
+        client = LLMClient(cfg)
+        fake = _FakeAsyncOpenAI([_completion('{"name": "x", "n": 1}')])
+        _install_fake(client, "product", fake)
+
+        await client.call_structured(role="product", user_message="hi", schema=_Toy)
+        assert fake.chat.completions.calls[0]["max_tokens"] == 4321
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_explicit_max_tokens_overrides_config() -> None:
+    """A per-call max_tokens still wins."""
+    async def run() -> None:
+        cfg = _make_config(max_response_tokens=4321)
+        client = LLMClient(cfg)
+        fake = _FakeAsyncOpenAI([_completion('{"name": "x", "n": 1}')])
+        _install_fake(client, "product", fake)
+
+        await client.call_structured(
+            role="product", user_message="hi", schema=_Toy, max_tokens=99
+        )
+        assert fake.chat.completions.calls[0]["max_tokens"] == 99
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_truncated_response_logs_helpful_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """When the model is cut off mid-string, our warning explicitly says so."""
+    import logging as _logging
+
+    async def run() -> None:
+        cfg = _make_config(max_retries=2)
+        client = LLMClient(cfg)
+        # First response is a truncated JSON (no closing quote/brace) and
+        # finish_reason="length" — exactly what an OpenAI-compatible
+        # server emits when max_tokens is hit.
+        truncated = '{"name": "x", "long": "aaaaaa'
+        fake = _FakeAsyncOpenAI(
+            [
+                _completion(truncated, finish_reason="length"),
+                _completion('{"name": "x", "n": 1}'),
+            ]
+        )
+        _install_fake(client, "product", fake)
+
+        out = await client.call_structured(
+            role="product", user_message="hi", schema=_Toy
+        )
+        assert out.n == 1
+        await client.close()
+
+    with caplog.at_level(_logging.WARNING, logger="orgos.llm"):
+        asyncio.run(run())
+
+    truncation_logs = [r for r in caplog.records if "TRUNCATED" in r.getMessage()]
+    assert truncation_logs, f"expected a truncation warning, got: {[r.getMessage() for r in caplog.records]}"
+    msg = truncation_logs[0].getMessage()
+    assert "ORGOS_MAX_RESPONSE_TOKENS" in msg
+    assert "finish_reason=length" in msg
+
+
+def test_truncated_response_via_unterminated_string_pattern() -> None:
+    """Even if finish_reason is missing, JSONDecodeError text triggers detection."""
+    from orgos.llm import _looks_truncated  # type: ignore[attr-defined]
+
+    try:
+        json_module_decode_error()
+    except Exception as e:  # noqa: BLE001
+        assert isinstance(e, ValueError)
+        # Generic Python JSONDecodeError with "Unterminated string"
+        # message should be flagged even with finish_reason="unknown".
+        from json import JSONDecodeError
+        assert isinstance(e, JSONDecodeError)
+        assert _looks_truncated(e, "unknown") is True
+        # Sanity: a well-formed but invalid-schema error shouldn't false-positive.
+        try:
+            import json as _json
+            _json.loads('{"name": "x", "n":}')
+        except _json.JSONDecodeError as e2:
+            # "Expecting value" — this is bad JSON but NOT truncation.
+            assert _looks_truncated(e2, "stop") is False
+
+
+def json_module_decode_error() -> None:
+    """Helper: trigger an Unterminated-string JSONDecodeError."""
+    import json as _json
+
+    _json.loads('{"name": "x", "long": "aaaaaa')

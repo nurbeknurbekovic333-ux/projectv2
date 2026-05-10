@@ -109,11 +109,20 @@ class LLMClient:
             ``config.retry_backoff_max`` seconds;
           * malformed JSON in the response body (no sleep);
           * JSON that doesn't validate against ``schema`` (no sleep).
+
+        ``max_tokens`` defaults to ``Config.max_response_tokens`` (8192)
+        so big implementer outputs don't get silently truncated by a
+        small server-side default — a truncated response shows up as a
+        ``json.JSONDecodeError("Unterminated string")`` and we log a
+        loud warning telling the operator how to fix it.
         """
 
         if max_retries is None:
             max_retries = self.config.max_retries
         max_retries = max(1, max_retries)
+
+        if max_tokens is None:
+            max_tokens = self.config.max_response_tokens
 
         system_prompt = self.load_prompt(role)
         model = self.config.model_for(role)
@@ -161,17 +170,32 @@ class LLMClient:
                     continue
 
             content = response.choices[0].message.content or ""
+            finish_reason = _finish_reason(response)
             try:
                 parsed = json.loads(_strip_fences(content))
             except json.JSONDecodeError as e:
                 last_err = e
-                logger.warning(
-                    "LLM call %s returned non-JSON (attempt %d/%d): %s",
-                    role,
-                    attempt,
-                    max_retries,
-                    content[:200],
-                )
+                if _looks_truncated(e, finish_reason):
+                    logger.warning(
+                        "LLM call %s was TRUNCATED at ~%d chars (finish_reason=%s, "
+                        "max_tokens=%d). Bump ORGOS_MAX_RESPONSE_TOKENS in .env, "
+                        "or simplify the project idea so the architect plans "
+                        "fewer files per domain. Attempt %d/%d.",
+                        role,
+                        len(content),
+                        finish_reason,
+                        max_tokens,
+                        attempt,
+                        max_retries,
+                    )
+                else:
+                    logger.warning(
+                        "LLM call %s returned non-JSON (attempt %d/%d): %s",
+                        role,
+                        attempt,
+                        max_retries,
+                        content[:200],
+                    )
                 continue
 
             try:
@@ -216,3 +240,30 @@ def _strip_fences(text: str) -> str:
         if s.endswith("```"):
             s = s[:-3]
     return s.strip()
+
+
+def _finish_reason(response: object) -> str:
+    """Best-effort extraction of OpenAI's ``finish_reason`` field.
+
+    Returns ``"unknown"`` if the response object doesn't expose one
+    (e.g. our test fakes don't bother).
+    """
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return "unknown"
+    first = choices[0]
+    return getattr(first, "finish_reason", None) or "unknown"
+
+
+def _looks_truncated(err: json.JSONDecodeError, finish_reason: str) -> bool:
+    """Heuristic: did this JSON fail because the model hit max_tokens?
+
+    The two strong signals:
+      * ``finish_reason == "length"`` (OpenAI-compatible servers set
+        this when generation was cut by max_tokens);
+      * the JSONDecodeError message starts with ``Unterminated string``
+        — i.e. the model ran out of room mid-quote.
+    """
+    if finish_reason == "length":
+        return True
+    return "Unterminated string" in str(err)
